@@ -6,6 +6,7 @@ first failed expectation.
 """
 from __future__ import annotations
 
+import base64
 import json
 import sys
 import threading
@@ -142,8 +143,73 @@ def main() -> int:
                     f"field {field} changed across reopen")
     assert_that(after["generation"] == before["generation"], "generation changed across reopen")
 
+    # --- request_id identity binding on device s3 ---------------------------
+    call("POST", "/api/devices", {"device_id": "s3", "version": "1.0.0"}, 201)
+
+    # retry-1 stages and verifies 2.0.0 into slot B
+    _, b = call("POST", "/api/devices/s3/candidate",
+                {"version": "2.0.0", "request_id": "retry-1"}, 200)
+    assert_that(b["outcome"] == "staged", "initial candidate must stage")
+    digest_b = b["device"]["slots"]["B"]["digest"]
+    evidence_before = b["device"]["evidence"]
+
+    # same request_id carrying a different version must be rejected and must
+    # not clear, replace, or re-verify the pending 2.0.0 candidate
+    _, b = call("POST", "/api/devices/s3/candidate",
+                {"version": "3.0.0", "request_id": "retry-1"}, 409)
+    assert_that(b["error"]["code"] == "request_identity_mismatch",
+                "identity-mismatched reuse must be request_identity_mismatch")
+    assert_that(b["error"]["bound_version"] == "2.0.0", "bound version must be 2.0.0")
+    _, d = call("GET", "/api/devices/s3", expect=200)
+    d = d["device"]
+    assert_that(d["slots"]["B"]["version"] == "2.0.0",
+                "B slot must still hold 2.0.0 after rejected reuse")
+    assert_that(d["slots"]["B"]["status"] == "VERIFIED",
+                "B slot must stay VERIFIED after rejected reuse")
+    assert_that(d["slots"]["B"]["digest"] == digest_b, "B slot digest must not change")
+    assert_that(d["active_slot"] == "A" and d["slots"]["A"]["version"] == "1.0.0",
+                "active slot must be untouched")
+
+    # same request_id, same version, but different content -> also rejected
+    forged = base64.b64encode(b"forged-image-bytes").decode()
+    _, b = call("POST", "/api/devices/s3/candidate",
+                {"version": "2.0.0", "request_id": "retry-1", "content_b64": forged}, 409)
+    assert_that(b["error"]["code"] == "request_identity_mismatch",
+                "content-mismatched reuse must be rejected too")
+
+    # byte-identical retry -> idempotent replay, candidate and evidence intact
+    _, b = call("POST", "/api/devices/s3/candidate",
+                {"version": "2.0.0", "request_id": "retry-1"}, 200)
+    assert_that(b["outcome"] == "staged" and b.get("idempotent_replay") is True,
+                "identical retry must replay the original outcome")
+    _, d = call("GET", "/api/devices/s3", expect=200)
+    d = d["device"]
+    assert_that(d["slots"]["B"]["version"] == "2.0.0"
+                and d["slots"]["B"]["status"] == "VERIFIED"
+                and d["slots"]["B"]["digest"] == digest_b,
+                "identical retry must not rewrite the candidate")
+    assert_that(d["evidence"] == evidence_before,
+                "identical retry must not append staging evidence")
+
+    # a different request_id still gets the stable qualification conflict
+    _, b = call("POST", "/api/devices/s3/candidate",
+                {"version": "3.0.0", "request_id": "retry-2"}, 409)
+    assert_that(b["error"]["code"] == "upgrade_conflict",
+                "different request_id must keep the upgrade_conflict semantics")
+    assert_that(b["error"]["holder_request"] == "retry-1", "holder must be retry-1")
+
+    # the verified 2.0.0 candidate survived every rejected retry: it confirms
+    _, b = call("POST", "/api/devices/s3/confirm", {}, 200)
+    assert_that(b["outcome"] == "switched" and b["generation"] == 2,
+                "bound candidate must still confirm")
+    rec, d = power_cycle("s3", "B", 2)
+    assert_that(d["slots"]["B"]["version"] == "2.0.0"
+                and d["slots"]["B"]["digest"] == digest_b,
+                "confirmed slot must be the original verified 2.0.0 image")
+
     print(f"SMOKE OK: {checks} HTTP assertions passed "
-          f"(power-loss x3, corrupt candidate, concurrent 409, reopen consistency)")
+          f"(power-loss x3, corrupt candidate, concurrent 409, "
+          f"request_id identity binding, reopen consistency)")
     return 0
 
 

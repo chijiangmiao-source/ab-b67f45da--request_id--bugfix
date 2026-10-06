@@ -228,6 +228,8 @@ function renderCandidate() {
     } catch (e) {
       if (e.status === 409 && e.data?.error?.code === 'upgrade_conflict') {
         flash('err', `冲突 409：当前代次升级资格已被 ${e.data.error.holder_request} 取得，本请求未改写任何活动版本。`);
+      } else if (e.status === 409 && e.data?.error?.code === 'request_identity_mismatch') {
+        flash('err', `冲突 409：request_id「${e.data.error.holder_request}」已绑定候选版本 ${e.data.error.bound_version}，携带不同版本/摘要/内容的复用被拒绝，既有待确认候选未被改写。`);
       } else flash('err', `候选提交失败：${e.message}`);
       await refresh(d.device_id);
     } finally { submit.disabled = false; }

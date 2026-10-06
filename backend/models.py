@@ -161,6 +161,10 @@ class Device:
     qualified_generation: Optional[int] = None
     qualified_request: Optional[str] = None
     qualified_slot: Optional[str] = None
+    # Candidate identity (version/digest/content) bound to the qualifying
+    # request_id at staging time. The same request_id may only retry that
+    # exact candidate; reusing it with a different identity is rejected.
+    qualified_fingerprint: Optional[dict] = None
     last_recovery: Optional[RecoveryReport] = None
     recovery_history: list[RecoveryReport] = field(default_factory=list)
     evidence: list[dict] = field(default_factory=list)
@@ -191,6 +195,9 @@ class Device:
             "qualified_generation": self.qualified_generation,
             "qualified_request": self.qualified_request,
             "qualified_slot": self.qualified_slot,
+            "qualified_fingerprint": dict(self.qualified_fingerprint)
+            if self.qualified_fingerprint
+            else None,
             "slots": {name: s.to_dict() for name, s in self.slots.items()},
             "last_recovery": self.last_recovery.to_dict()
             if self.last_recovery
@@ -210,6 +217,9 @@ class Device:
             qualified_generation=data.get("qualified_generation"),
             qualified_request=data.get("qualified_request"),
             qualified_slot=data.get("qualified_slot"),
+            qualified_fingerprint=dict(data["qualified_fingerprint"])
+            if data.get("qualified_fingerprint")
+            else None,
             evidence=list(data.get("evidence", [])),
             evidence_seq=data.get("evidence_seq", 0),
         )

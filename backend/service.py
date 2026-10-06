@@ -8,6 +8,11 @@ The service enforces three safety rules:
 2. **Generation qualification** -- at any generation exactly one submitting
    request may stage a candidate. Competing submissions get a stable ``409``
    and touch nothing (SQLite ``BEGIN IMMEDIATE`` serialises the decision).
+   The winning ``request_id`` is bound to the candidate identity (version,
+   digest, content) it first staged: byte-identical retries replay the
+   original outcome, while reusing the identifier with a different identity
+   is rejected with ``409`` and never clears, replaces, or re-verifies the
+   pending candidate.
 3. **Unique-confirmed-slot boot** -- recovery selects the unique slot with a
    complete manifest that is ``CONFIRMED``. Unconfirmed / corrupt candidates
    are diagnosed but never booted, and a ``SUPERSEDED`` slot can never return,
@@ -139,6 +144,16 @@ class UpgradeService:
         claimed = (req.digest or sha256_hex(req.content)).lower()
         if req.fault_point not in (None, "candidate_write", "digest_check"):
             raise ApiError(400, "bad_fault_point", "未知故障点")
+        # Identity of the candidate this request is trying to stage. A
+        # request_id that wins the qualification is bound to the identity it
+        # first submitted: byte-identical retries replay the original outcome,
+        # anything else carrying the same request_id is rejected.
+        fingerprint = {
+            "version": req.version,
+            "digest": claimed,
+            "content_sha256": sha256_hex(req.content),
+            "size": len(req.content),
+        }
 
         with self.store.transaction() as conn:
             raw = self.store.load_raw(device_id)
@@ -164,19 +179,42 @@ class UpgradeService:
             if (
                 dev.qualified_generation == dev.generation
                 and dev.qualified_request
-                and dev.qualified_request != request_id
             ):
-                raise ApiError(
-                    409,
-                    "upgrade_conflict",
-                    "当前代次的升级资格已被另一请求取得",
-                    extra={
-                        "generation": dev.generation,
-                        "holder_request": dev.qualified_request,
-                        "active_slot": dev.active_slot,
-                        "active_version": active.version,
-                    },
-                )
+                if dev.qualified_request != request_id:
+                    raise ApiError(
+                        409,
+                        "upgrade_conflict",
+                        "当前代次的升级资格已被另一请求取得",
+                        extra={
+                            "generation": dev.generation,
+                            "holder_request": dev.qualified_request,
+                            "active_slot": dev.active_slot,
+                            "active_version": active.version,
+                        },
+                    )
+                # Same request_id: it is bound to the candidate identity it
+                # first staged at this generation. Reusing the identifier with
+                # a different version, digest, or content must be rejected
+                # without clearing, replacing, or re-verifying the pending
+                # candidate; a byte-identical retry just replays the outcome.
+                if not self._same_candidate(dev, fingerprint):
+                    bound = self._bound_identity(dev)
+                    raise ApiError(
+                        409,
+                        "request_identity_mismatch",
+                        f"请求标识 {request_id} 已在代次 {dev.generation} 绑定候选"
+                        f"（槽位 {dev.qualified_slot}，版本 {bound['version']}，"
+                        f"摘要 {bound['digest'][:16]}…）；同一 request_id 携带不同"
+                        "版本、摘要或内容时被拒绝，既有待确认候选保持不变",
+                        extra={
+                            "generation": dev.generation,
+                            "holder_request": dev.qualified_request,
+                            "slot": dev.qualified_slot,
+                            "bound_version": bound["version"],
+                            "bound_digest": bound["digest"],
+                        },
+                    )
+                return self._replay_outcome(dev, request_id)
 
             target_name = dev.inactive_slot_name()
             target = dev.slots[target_name]
@@ -190,6 +228,7 @@ class UpgradeService:
             dev.qualified_generation = dev.generation
             dev.qualified_request = request_id
             dev.qualified_slot = target_name
+            dev.qualified_fingerprint = fingerprint
             dev.add_evidence(
                 target_name,
                 "candidate_staged",
@@ -254,6 +293,7 @@ class UpgradeService:
                 dev.qualified_generation = None
                 dev.qualified_request = None
                 dev.qualified_slot = None
+                dev.qualified_fingerprint = None
                 dev.add_evidence(
                     target_name,
                     "digest_mismatch",
@@ -284,6 +324,49 @@ class UpgradeService:
             "claimed_digest": claimed,
             "actual_digest": claimed,
             "device": self.store.load(device_id).to_dict(),
+        }
+
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _same_candidate(dev: Device, fingerprint: dict) -> bool:
+        """True iff the incoming request carries the bound candidate identity."""
+        bound = dev.qualified_fingerprint
+        if bound is not None:
+            return bound == fingerprint
+        # Rows staged before fingerprints existed: fall back to the manifest
+        # recorded on the qualified slot (version + claimed digest).
+        q = dev.slots[dev.qualified_slot or dev.inactive_slot_name()]
+        return (
+            fingerprint["version"] == q.version
+            and fingerprint["digest"] == (q.digest or "").lower()
+        )
+
+    @staticmethod
+    def _bound_identity(dev: Device) -> dict:
+        """Version/digest the qualifying request_id is bound to (for errors)."""
+        bound = dev.qualified_fingerprint
+        if bound is not None:
+            return {"version": bound["version"], "digest": bound["digest"]}
+        q = dev.slots[dev.qualified_slot or dev.inactive_slot_name()]
+        return {"version": q.version, "digest": q.digest or ""}
+
+    @staticmethod
+    def _replay_outcome(dev: Device, request_id: str) -> dict:
+        """Idempotent retry of the request holding the qualification.
+
+        The pending candidate is reported exactly as persisted: an identical
+        retry must never rewrite, replace, or re-verify the staged image.
+        """
+        target_name = dev.qualified_slot or dev.inactive_slot_name()
+        t = dev.slots[target_name]
+        return {
+            "outcome": "staged" if t.status is SlotStatus.VERIFIED else "in_progress",
+            "request_id": request_id,
+            "target_slot": target_name,
+            "claimed_digest": t.digest,
+            "actual_digest": t.actual_digest,
+            "idempotent_replay": True,
+            "device": dev.to_dict(),
         }
 
     # ------------------------------------------------------------------ #
@@ -359,6 +442,7 @@ class UpgradeService:
             dev.qualified_generation = None
             dev.qualified_request = None
             dev.qualified_slot = None
+            dev.qualified_fingerprint = None
             dev.add_evidence(
                 target_name,
                 "switch_committed",
@@ -405,6 +489,7 @@ class UpgradeService:
                     dev.qualified_generation = None
                     dev.qualified_request = None
                     dev.qualified_slot = None
+                    dev.qualified_fingerprint = None
             self.store.set_powered(conn, device_id, True)
             self.store.save(conn, dev)
 

@@ -5,7 +5,8 @@
 - **任意时点断电都不会引导摘要不符或未确认的候选**；
 - **新版本生效后永不回退**（旧槽位标记 `SUPERSEDED`，恢复时永不选择）；
 - 恢复时**仅从「清单完整且已确认」的槽位中选定唯一活动槽位**，并展示逐槽诊断证据与裁决理由；
-- 两个页面并发提交不同候选时，**仅一个请求取得当前代次的升级资格**，另一个得到稳定 `409` 且不改写活动版本。
+- 两个页面并发提交不同候选时，**仅一个请求取得当前代次的升级资格**，另一个得到稳定 `409` 且不改写活动版本；
+- 取得资格的 `request_id` **绑定其首次提交的候选身份**（版本、摘要、内容）：完全相同的重试幂等地返回原结果且不改写候选；携带不同版本、摘要或内容复用该标识将被拒绝（`409 request_identity_mismatch`），既有的待确认候选不会被清空、替换或再次验证。
 
 ## 架构
 
@@ -17,10 +18,10 @@ backend/          FastAPI 服务
   service.py      升级编排：代次资格、摘要校验、原子确认切换、断电恢复裁决
   api.py          HTTP API + 托管 web/dist 静态页面
 web/              Vite 原生 JS 前端（中文界面，全部操作经真实 API）
-tests/            pytest（14 个用例：三种断电、损坏候选、并发裁决、防回退、重开一致）
+tests/            pytest（21 个用例：三种断电、损坏候选、并发裁决、防回退、重开一致、request_id 身份绑定）
 scripts/
   verify.sh       一次性验收：pytest → 构建页面 → 真实 uvicorn → HTTP 冒烟
-  smoke_http.py   断电恢复与并发裁决的 HTTP 冒烟（63 条断言）
+  smoke_http.py   断电恢复、并发裁决与 request_id 身份绑定的 HTTP 冒烟（91 条断言）
 Dockerfile        运行镜像（多阶段：Node 构建页面 + Python 运行）
 Dockerfile.verify 验收镜像（含 Node/Python，compose 中的 verify 服务）
 docker-compose.yml
@@ -58,7 +59,7 @@ docker compose run --rm verify
 
 1. `pytest` 代码测试；
 2. `npm run build` 构建页面；
-3. 启动**真实 uvicorn**，对三种断电恢复、损坏候选、并发 409 裁决、切换后重开一致性进行 HTTP 冒烟；
+3. 启动**真实 uvicorn**，对三种断电恢复、损坏候选、并发 409 裁决、request_id 身份绑定（相同重试幂等 / 不同内容复用拒绝）、切换后重开一致性进行 HTTP 冒烟；
 4. 执行完毕**自行退出**，全部通过退出码为 0，任一失败非 0。
 
 ## 本地开发（无 Docker）
