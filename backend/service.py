@@ -8,6 +8,10 @@ The service enforces three safety rules:
 2. **Generation qualification** -- at any generation exactly one submitting
    request may stage a candidate. Competing submissions get a stable ``409``
    and touch nothing (SQLite ``BEGIN IMMEDIATE`` serialises the decision).
+   The winning ``request_id`` is bound to the identity of the candidate it
+   first staged: a byte-identical retry replays idempotently, while reusing
+   the id with a different version/digest/content is rejected without
+   clearing, replacing or re-verifying the pending candidate.
 3. **Unique-confirmed-slot boot** -- recovery selects the unique slot with a
    complete manifest that is ``CONFIRMED``. Unconfirmed / corrupt candidates
    are diagnosed but never booted, and a ``SUPERSEDED`` slot can never return,
@@ -161,11 +165,11 @@ class UpgradeService:
                 )
 
             # --- generation qualification (single winner per generation) ---
-            if (
+            holds_qualification = (
                 dev.qualified_generation == dev.generation
-                and dev.qualified_request
-                and dev.qualified_request != request_id
-            ):
+                and dev.qualified_request is not None
+            )
+            if holds_qualification and dev.qualified_request != request_id:
                 raise ApiError(
                     409,
                     "upgrade_conflict",
@@ -177,6 +181,52 @@ class UpgradeService:
                         "active_version": active.version,
                     },
                 )
+
+            # --- request_id identity binding --------------------------------
+            # The qualifying request_id is bound to the identity of the
+            # candidate it first staged at this generation. A byte-identical
+            # retry is an idempotent replay; reusing the id with a different
+            # version, digest or content is rejected and must never clear,
+            # replace or re-verify the pending candidate image.
+            fingerprint = {
+                "version": req.version,
+                "digest": claimed,
+                "content_sha256": sha256_hex(req.content),
+                "size": len(req.content),
+            }
+            if holds_qualification:
+                bound = dev.qualified_candidate or {}
+                if bound != fingerprint:
+                    raise ApiError(
+                        409,
+                        "request_identity_mismatch",
+                        f"请求 {request_id} 在代次 {dev.generation} 已绑定候选"
+                        f"（版本 {bound.get('version')}，摘要 "
+                        f"{(bound.get('digest') or '')[:16]}…），不得以同一标识"
+                        "提交版本、摘要或内容不同的候选",
+                        extra={
+                            "generation": dev.generation,
+                            "holder_request": dev.qualified_request,
+                            "bound_candidate": bound,
+                            "active_slot": dev.active_slot,
+                            "active_version": active.version,
+                        },
+                    )
+                replay_slot = dev.qualified_slot or dev.inactive_slot_name()
+                if dev.slots[replay_slot].status is SlotStatus.VERIFIED:
+                    # Idempotent replay: return the verified candidate as-is;
+                    # it is neither rewritten nor re-verified.
+                    return {
+                        "outcome": "staged",
+                        "request_id": request_id,
+                        "target_slot": replay_slot,
+                        "claimed_digest": claimed,
+                        "actual_digest": dev.slots[replay_slot].actual_digest,
+                        "replayed": True,
+                        "device": dev.to_dict(),
+                    }
+                # The first attempt was interrupted mid-write: fall through and
+                # re-stage the *identical* candidate to complete it.
 
             target_name = dev.inactive_slot_name()
             target = dev.slots[target_name]
@@ -190,6 +240,7 @@ class UpgradeService:
             dev.qualified_generation = dev.generation
             dev.qualified_request = request_id
             dev.qualified_slot = target_name
+            dev.qualified_candidate = fingerprint
             dev.add_evidence(
                 target_name,
                 "candidate_staged",
@@ -254,6 +305,7 @@ class UpgradeService:
                 dev.qualified_generation = None
                 dev.qualified_request = None
                 dev.qualified_slot = None
+                dev.qualified_candidate = None
                 dev.add_evidence(
                     target_name,
                     "digest_mismatch",
@@ -359,6 +411,7 @@ class UpgradeService:
             dev.qualified_generation = None
             dev.qualified_request = None
             dev.qualified_slot = None
+            dev.qualified_candidate = None
             dev.add_evidence(
                 target_name,
                 "switch_committed",
@@ -405,6 +458,7 @@ class UpgradeService:
                     dev.qualified_generation = None
                     dev.qualified_request = None
                     dev.qualified_slot = None
+                    dev.qualified_candidate = None
             self.store.set_powered(conn, device_id, True)
             self.store.save(conn, dev)
 

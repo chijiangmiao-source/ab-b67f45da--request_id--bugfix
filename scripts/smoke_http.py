@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""HTTP smoke test for power-loss recovery and concurrent adjudication.
+"""HTTP smoke test for power-loss recovery, concurrent adjudication and
+request-id identity binding.
 
 Talks to a *live* uvicorn server (plain stdlib only) and exits non-zero on the
 first failed expectation.
@@ -142,8 +143,52 @@ def main() -> int:
                     f"field {field} changed across reopen")
     assert_that(after["generation"] == before["generation"], "generation changed across reopen")
 
+    # --- request_id identity binding on device s3 ---------------------------
+    call("POST", "/api/devices", {"device_id": "s3", "version": "1.0.0"}, 201)
+    _, b = call("POST", "/api/devices/s3/candidate",
+                {"version": "2.0.0", "request_id": "retry-1"}, 200)
+    assert_that(b["outcome"] == "staged", "initial candidate not staged")
+    assert_that(b["device"]["slots"]["B"]["status"] == "VERIFIED", "candidate not verified")
+    digest_v2 = b["device"]["slots"]["B"]["digest"]
+
+    # same request_id carrying a different candidate -> rejected; the verified
+    # 2.0.0 image in slot B must not be cleared, replaced or re-verified
+    _, b = call("POST", "/api/devices/s3/candidate",
+                {"version": "3.0.0", "request_id": "retry-1"}, 409)
+    assert_that(b["error"]["code"] == "request_identity_mismatch",
+                "request_id reuse with a different candidate must be rejected")
+    _, d = call("GET", "/api/devices/s3", expect=200)
+    d = d["device"]
+    assert_that(d["slots"]["B"]["version"] == "2.0.0",
+                "verified candidate was rewritten by a reused request_id")
+    assert_that(d["slots"]["B"]["status"] == "VERIFIED", "candidate lost VERIFIED status")
+    assert_that(d["slots"]["B"]["digest"] == digest_v2, "candidate digest changed")
+    assert_that(d["qualified_request"] == "retry-1", "qualification holder changed")
+
+    # byte-identical retry is an idempotent replay: candidate untouched
+    _, b = call("POST", "/api/devices/s3/candidate",
+                {"version": "2.0.0", "request_id": "retry-1"}, 200)
+    assert_that(b["device"]["slots"]["B"]["status"] == "VERIFIED", "replay lost verification")
+    assert_that(b["device"]["slots"]["B"]["digest"] == digest_v2,
+                "identical retry rewrote the candidate")
+
+    # a different request_id still loses the generation qualification
+    _, b = call("POST", "/api/devices/s3/candidate",
+                {"version": "3.0.0", "request_id": "retry-2"}, 409)
+    assert_that(b["error"]["code"] == "upgrade_conflict",
+                "different request_id must get upgrade_conflict")
+
+    # the preserved 2.0.0 candidate confirms and boots across a power cycle
+    _, b = call("POST", "/api/devices/s3/confirm", {}, 200)
+    assert_that(b["outcome"] == "switched" and b["generation"] == 2,
+                "preserved candidate not confirmable")
+    rec, d = power_cycle("s3", "B", 2)
+    assert_that(d["slots"]["B"]["version"] == "2.0.0", "booted version mismatch")
+    assert_that(d["slots"]["B"]["digest"] == digest_v2, "booted digest mismatch")
+
     print(f"SMOKE OK: {checks} HTTP assertions passed "
-          f"(power-loss x3, corrupt candidate, concurrent 409, reopen consistency)")
+          f"(power-loss x3, corrupt candidate, concurrent 409, "
+          f"request-id binding, reopen consistency)")
     return 0
 
 
